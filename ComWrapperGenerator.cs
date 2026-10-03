@@ -16,6 +16,7 @@
 //   - Complex objects from the same assembly (recursive wrapping)
 //   - Static methods & static properties
 //   - Method overload renaming
+//   - Indexers as GetItem/SetItem (with overload renaming)
 // ======================================================================
 
 using System.Reflection;
@@ -87,7 +88,7 @@ sb.AppendLine("// Auto-generated COM Wrapper");
 sb.AppendLine($"// Source        : {Path.GetFileName(dllPath)}");
 sb.AppendLine($"// Generated     : {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
 sb.AppendLine("// Features      : Factory, Collections, out/ref, Events+args,");
-sb.AppendLine("//                 Complex objects, Static members, Overload renaming");
+sb.AppendLine("//                 Complex objects, Static members, Overload renaming, Indexers");
 sb.AppendLine("// Generator     : ComWrapperGenerator (full extended)");
 sb.AppendLine("// ======================================================================");
 sb.AppendLine();
@@ -444,10 +445,13 @@ static bool GenerateWrapper(
     var instanceMethods = GetInstanceMethods(type, wrapperMap);
     var staticProps = GetStaticProperties(type, wrapperMap);
     var staticMethods = GetStaticMethods(type, wrapperMap);
+    var indexers = GetIndexers(type, wrapperMap);
+    var indexerNames = BuildIndexerNames(indexers);
 
     bool hasStaticMembers = staticProps.Count > 0 || staticMethods.Count > 0;
+    bool hasIndexers = indexers.Count > 0;
 
-    if (!hasParameterless && parameterizedCtors.Count == 0 && !hasStaticMembers)
+    if (!hasParameterless && parameterizedCtors.Count == 0 && !hasStaticMembers && !hasIndexers)
     {
         Console.WriteLine($"  [SKIP] {className} - no suitable constructors or static members");
         return false;
@@ -510,6 +514,13 @@ static bool GenerateWrapper(
 
     foreach (var method in instanceMethods)
         WriteMethodToInterface(sb, method, uniqueNames[method], wrapperMap);
+
+    // Indexers -> GetItem / SetItem
+    foreach (var idx in indexers)
+    {
+        var (getName, setName) = indexerNames[idx];
+        WriteIndexerToInterface(sb, idx, getName, setName, wrapperMap);
+    }
 
     foreach (var prop in staticProps)
         WritePropertyToInterface(sb, prop, wrapperMap);
@@ -619,6 +630,12 @@ static bool GenerateWrapper(
     foreach (var method in instanceMethods)
         WriteInstanceMethodImpl(sb, method, uniqueNames[method], wrapperMap);
 
+    foreach (var idx in indexers)
+    {
+        var (getName, setName) = indexerNames[idx];
+        WriteIndexerImpl(sb, idx, getName, setName, wrapperMap);
+    }
+
     foreach (var prop in staticProps)
         WriteStaticPropertyImpl(sb, prop, fullOriginalName, wrapperMap);
 
@@ -630,7 +647,8 @@ static bool GenerateWrapper(
     Console.WriteLine($"  [OK]   {className}" +
                       (parameterizedCtors.Count > 0 ? " (factory)" : "") +
                       (hasEvents ? " (events)" : "") +
-                      (hasStaticMembers ? " (static)" : ""));
+                      (hasStaticMembers ? " (static)" : "") +
+                      (hasIndexers ? " (indexers)" : ""));
     return true;
 }
 
@@ -678,6 +696,46 @@ static List<MethodInfo> GetStaticMethods(Type type, Dictionary<string, string> w
         .ToList();
 }
 
+static List<PropertyInfo> GetIndexers(Type type, Dictionary<string, string> wrapperMap)
+{
+    return type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+        .Where(p => p.GetIndexParameters().Length > 0)
+        .Where(p => IsSupported(p.PropertyType, wrapperMap))
+        .Where(p => p.GetIndexParameters().All(ip => IsSupported(ip.ParameterType, wrapperMap)))
+        .ToList();
+}
+
+/// <summary>
+/// Build unique GetItem/SetItem names for indexers (overload renaming by index parameter types).
+/// </summary>
+static Dictionary<PropertyInfo, (string getName, string setName)> BuildIndexerNames(IEnumerable<PropertyInfo> indexers)
+{
+    var list = indexers.OrderBy(p => p.GetIndexParameters().Length)
+                       .ThenBy(p => string.Join(",", p.GetIndexParameters().Select(x => x.ParameterType.FullName)))
+                       .ToList();
+    var result = new Dictionary<PropertyInfo, (string getName, string setName)>();
+
+    if (list.Count == 0) return result;
+
+    if (list.Count == 1)
+    {
+        var p = list[0];
+        result[p] = ("GetItem", "SetItem");
+        return result;
+    }
+
+    // First keeps plain GetItem/SetItem; rest get type suffix
+    result[list[0]] = ("GetItem", "SetItem");
+    for (int i = 1; i < list.Count; i++)
+    {
+        var p = list[i];
+        string suffix = string.Join("_", p.GetIndexParameters().Select(ip => GetTypeSuffix(ip.ParameterType)));
+        if (string.IsNullOrEmpty(suffix)) suffix = $"Overload{i}";
+        result[p] = ($"GetItem_{suffix}", $"SetItem_{suffix}");
+    }
+    return result;
+}
+
 static void WritePropertyToInterface(StringBuilder sb, PropertyInfo prop, Dictionary<string, string> wrapperMap)
 {
     string typeName = GetTypeName(prop.PropertyType, wrapperMap, forCom: true);
@@ -699,6 +757,47 @@ static void WriteMethodToInterface(StringBuilder sb, MethodInfo method, string m
         .Select(p => FormatParameter(p, wrapperMap, forCom: true)));
 
     sb.AppendLine($"        {returnType} {methodName}({parameters});");
+}
+
+static void WriteIndexerToInterface(StringBuilder sb, PropertyInfo indexer, string getName, string setName, Dictionary<string, string> wrapperMap)
+{
+    string valueType = GetTypeName(indexer.PropertyType, wrapperMap, forCom: true);
+    string indexParams = string.Join(", ", indexer.GetIndexParameters()
+        .Select(p => $"{GetTypeName(p.ParameterType, wrapperMap, forCom: true)} {p.Name}"));
+
+    if (indexer.CanRead)
+        sb.AppendLine($"        {valueType} {getName}({indexParams});");
+    if (indexer.CanWrite)
+        sb.AppendLine($"        void {setName}({indexParams}, {valueType} value);");
+}
+
+static void WriteIndexerImpl(StringBuilder sb, PropertyInfo indexer, string getName, string setName, Dictionary<string, string> wrapperMap)
+{
+    string valueType = GetTypeName(indexer.PropertyType, wrapperMap, forCom: true);
+    var indexParamsInfos = indexer.GetIndexParameters();
+    string indexParams = string.Join(", ", indexParamsInfos
+        .Select(p => $"{GetTypeName(p.ParameterType, wrapperMap, forCom: true)} {p.Name}"));
+    string indexArgs = string.Join(", ", indexParamsInfos.Select(p => p.Name));
+
+    if (indexer.CanRead)
+    {
+        sb.AppendLine($"        public {valueType} {getName}({indexParams})");
+        sb.AppendLine("        {");
+        sb.AppendLine("            EnsureInitialized();");
+        sb.AppendLine($"            return {ConvertToWrapper($"_inner![{indexArgs}]", indexer.PropertyType, wrapperMap)};");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+    }
+
+    if (indexer.CanWrite)
+    {
+        sb.AppendLine($"        public void {setName}({indexParams}, {valueType} value)");
+        sb.AppendLine("        {");
+        sb.AppendLine("            EnsureInitialized();");
+        sb.AppendLine($"            _inner![{indexArgs}] = {ConvertToOriginal("value", indexer.PropertyType, wrapperMap)};");
+        sb.AppendLine("        }");
+        sb.AppendLine();
+    }
 }
 
 static void WriteInstancePropertyImpl(StringBuilder sb, PropertyInfo prop, Dictionary<string, string> wrapperMap)
